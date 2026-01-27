@@ -1,8 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::fmt::Write as _;
-use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
+use cyw43_pio::PioSpi;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_net::tcp::TcpSocket;
@@ -10,7 +9,7 @@ use embassy_net::{Config, Stack, StackResources};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0, UART0};
-use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
+use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
 use embassy_time::{Duration, Timer};
 use embedded_io_async::Read;
@@ -20,19 +19,12 @@ use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 // Program metadata
-#[link_section = ".bi_entries"]
+#[link_section = ".start_block"]
 #[used]
-pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 4] = [
-    embassy_rp::binary_info::rp_program_name!(c"Pico LTE Proxy"),
-    embassy_rp::binary_info::rp_program_description!(
-        c"Pico 2W WiFi AP + EC800K LTE HTTP Proxy"
-    ),
-    embassy_rp::binary_info::rp_cargo_version!(),
-    embassy_rp::binary_info::rp_program_build_attribute!(),
-];
+pub static IMAGE_DEF: embassy_rp::binary_info::ImageDef = embassy_rp::binary_info::ImageDef::secure_exe();
 
 bind_interrupts!(struct Irqs {
-    PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
+    PIO0_IRQ_0 => InterruptHandler<PIO0>;
     UART0_IRQ => BufferedInterruptHandler<UART0>;
 });
 
@@ -52,8 +44,8 @@ async fn cyw43_task(
 }
 
 #[embassy_executor::task]
-async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
-    runner.run().await
+async fn net_task(stack: &'static Stack<'static>) -> ! {
+    stack.run().await
 }
 
 // Global channel for UART communication
@@ -81,7 +73,7 @@ struct UartResponse {
 }
 
 #[embassy_executor::task]
-async fn uart_task(mut uart: BufferedUart<'static, UART0>) {
+async fn uart_task(mut uart: BufferedUart<'static>) {
     info!("UART task started at {} baud", UART_BAUDRATE);
 
     // Initialize EC800K
@@ -129,7 +121,7 @@ async fn uart_task(mut uart: BufferedUart<'static, UART0>) {
     }
 }
 
-async fn send_at_command(uart: &mut BufferedUart<'static, UART0>, cmd: &str) {
+async fn send_at_command(uart: &mut BufferedUart<'static>, cmd: &str) {
     let mut cmd_buf = String::<256>::new();
     let _ = cmd_buf.push_str(cmd);
     let _ = cmd_buf.push_str("\r\n");
@@ -141,27 +133,26 @@ async fn send_at_command(uart: &mut BufferedUart<'static, UART0>, cmd: &str) {
     let mut response = [0u8; 512];
     Timer::after(Duration::from_millis(100)).await;
 
-    if let Ok(n) =
+    if let Ok(Ok(n)) =
         embassy_time::with_timeout(Duration::from_secs(2), uart.read(&mut response)).await
     {
-        if let Ok(n) = n {
-            if let Ok(resp_str) = core::str::from_utf8(&response[..n]) {
-                info!("RX: {}", resp_str.trim());
-            }
+        if let Ok(resp_str) = core::str::from_utf8(&response[..n]) {
+            info!("RX: {}", resp_str.trim());
         }
     }
 }
 
-async fn clear_uart_buffer(uart: &mut BufferedUart<'static, UART0>) {
+async fn clear_uart_buffer(uart: &mut BufferedUart<'static>) {
     Timer::after(Duration::from_millis(500)).await;
     let mut discard = [0u8; 256];
-    while let Ok(_) =
-        embassy_time::with_timeout(Duration::from_millis(100), uart.read(&mut discard)).await
+    while embassy_time::with_timeout(Duration::from_millis(100), uart.read(&mut discard))
+        .await
+        .is_ok()
     {}
 }
 
 async fn fetch_via_lte(
-    uart: &mut BufferedUart<'static, UART0>,
+    uart: &mut BufferedUart<'static>,
     host: &str,
     path: &str,
 ) -> UartResponse {
@@ -173,6 +164,7 @@ async fn fetch_via_lte(
     // Step 1: Open TCP connection
     info!("1. Opening TCP connection...");
     let mut open_cmd = String::<256>::new();
+    use core::fmt::Write;
     let _ = write!(open_cmd, "AT+QIOPEN=1,0,\"TCP\",\"{}\",80,0,1\r\n", host);
     let _ = uart.write_all(open_cmd.as_bytes()).await;
 
@@ -181,19 +173,17 @@ async fn fetch_via_lte(
     let mut connected = false;
     for _ in 0..20 {
         Timer::after(Duration::from_millis(500)).await;
-        if let Ok(n) = embassy_time::with_timeout(
+        if let Ok(Ok(n)) = embassy_time::with_timeout(
             Duration::from_millis(500),
             uart.read(&mut response),
         )
         .await
         {
-            if let Ok(n) = n {
-                if let Ok(resp_str) = core::str::from_utf8(&response[..n]) {
-                    info!("Open response: {}", resp_str);
-                    if resp_str.contains("+QIOPEN: 0,0") {
-                        connected = true;
-                        break;
-                    }
+            if let Ok(resp_str) = core::str::from_utf8(&response[..n]) {
+                info!("Open response: {}", resp_str);
+                if resp_str.contains("+QIOPEN: 0,0") {
+                    connected = true;
+                    break;
                 }
             }
         }
@@ -201,8 +191,10 @@ async fn fetch_via_lte(
 
     if !connected {
         warn!("TCP connection failed");
+        let mut err_msg = String::new();
+        let _ = err_msg.push_str("TCP connection failed");
         return UartResponse {
-            data: String::from("TCP connection failed"),
+            data: err_msg,
             success: false,
         };
     }
@@ -227,14 +219,12 @@ async fn fetch_via_lte(
     // Wait for '>'
     Timer::after(Duration::from_millis(500)).await;
     let mut got_prompt = false;
-    if let Ok(n) =
+    if let Ok(Ok(n)) =
         embassy_time::with_timeout(Duration::from_secs(5), uart.read(&mut response)).await
     {
-        if let Ok(n) = n {
-            if let Ok(resp_str) = core::str::from_utf8(&response[..n]) {
-                if resp_str.contains(">") {
-                    got_prompt = true;
-                }
+        if let Ok(resp_str) = core::str::from_utf8(&response[..n]) {
+            if resp_str.contains(">") {
+                got_prompt = true;
             }
         }
     }
@@ -242,8 +232,10 @@ async fn fetch_via_lte(
     if !got_prompt {
         warn!("No send prompt received");
         let _ = uart.write_all(b"AT+QICLOSE=0\r\n").await;
+        let mut err_msg = String::new();
+        let _ = err_msg.push_str("No send prompt");
         return UartResponse {
-            data: String::from("No send prompt"),
+            data: err_msg,
             success: false,
         };
     }
@@ -256,19 +248,17 @@ async fn fetch_via_lte(
     info!("3. Waiting for SEND OK...");
     let mut got_send_ok = false;
     for _ in 0..10 {
-        if let Ok(n) = embassy_time::with_timeout(
+        if let Ok(Ok(n)) = embassy_time::with_timeout(
             Duration::from_millis(500),
             uart.read(&mut response),
         )
         .await
         {
-            if let Ok(n) = n {
-                if let Ok(resp_str) = core::str::from_utf8(&response[..n]) {
-                    if resp_str.contains("SEND OK") {
-                        got_send_ok = true;
-                        info!("✅ SEND OK received");
-                        break;
-                    }
+            if let Ok(resp_str) = core::str::from_utf8(&response[..n]) {
+                if resp_str.contains("SEND OK") {
+                    got_send_ok = true;
+                    info!("✅ SEND OK received");
+                    break;
                 }
             }
         }
@@ -325,7 +315,7 @@ async fn fetch_via_lte(
 }
 
 #[embassy_executor::task]
-async fn http_server_task(stack: &'static Stack<cyw43::NetDriver<'static>>) {
+async fn http_server_task(stack: &'static Stack<'static>) {
     info!("HTTP server starting...");
     Timer::after(Duration::from_secs(1)).await;
 
@@ -492,6 +482,7 @@ fn extract_html(data: &str) -> String<8192> {
 
 fn format_http_response(content: &str) -> String<8192> {
     let mut response = String::<8192>::new();
+    use core::fmt::Write;
     let _ = write!(
         response,
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{}",
@@ -502,6 +493,7 @@ fn format_http_response(content: &str) -> String<8192> {
 
 fn format_error_response(error: &str) -> String<8192> {
     let mut response = String::<8192>::new();
+    use core::fmt::Write;
     let _ = write!(
         response,
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
@@ -546,17 +538,18 @@ async fn main(spawner: Spawner) {
         p.PIN_24,
         p.PIN_29,
         p.DMA_CH0,
-        RM2_CLOCK_DIVIDER,
     );
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
     let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
-    spawner.spawn(cyw43_task(runner)).unwrap();
+    unwrap!(spawner.spawn(cyw43_task(runner)));
 
     // Start WiFi AP
     control.init(clm).await;
-    control.start_ap_open(WIFI_SSID, 5).await;
+    control
+        .start_ap_open(WIFI_SSID, 5)
+        .await;
 
     info!("WiFi AP started!");
 
@@ -570,15 +563,15 @@ async fn main(spawner: Spawner) {
     static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
     let resources = RESOURCES.init(StackResources::new());
 
-    static STACK: StaticCell<Stack<cyw43::NetDriver<'static>>> = StaticCell::new();
-    let stack = STACK.init(Stack::new(
+    static STACK: StaticCell<Stack<'static>> = StaticCell::new();
+    let stack = &*STACK.init(Stack::new(
         net_device,
         config,
         resources,
         embassy_rp::clocks::RoscRng,
     ));
 
-    spawner.spawn(net_task(stack.run())).unwrap();
+    unwrap!(spawner.spawn(net_task(stack)));
 
     info!("Network stack initialized at 192.168.4.1");
 
@@ -598,19 +591,19 @@ async fn main(spawner: Spawner) {
     let uart = BufferedUart::new(
         p.UART0,
         Irqs,
-        p.PIN_12, // TX
         p.PIN_13, // RX
+        p.PIN_12, // TX
         uart_tx_buf,
         uart_rx_buf,
         uart_config,
     );
 
-    spawner.spawn(uart_task(uart)).unwrap();
+    unwrap!(spawner.spawn(uart_task(uart)));
 
     info!("UART initialized");
 
     // Start HTTP server
-    spawner.spawn(http_server_task(stack)).unwrap();
+    unwrap!(spawner.spawn(http_server_task(stack)));
 
     info!("==================================================");
     info!("🚀 Auto-Proxy Ready!");
