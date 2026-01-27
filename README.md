@@ -1,1 +1,1 @@
-# rust_pico2w_https
+# rust_pico2w_ec800k_http
