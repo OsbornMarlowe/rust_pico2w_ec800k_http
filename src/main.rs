@@ -5,7 +5,7 @@ use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_net::tcp::TcpSocket;
-use embassy_net::{Config, Stack, StackResources};
+use embassy_net::{Config, IpListenEndpoint, Stack, StackResources};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0, UART0};
@@ -17,15 +17,16 @@ use embassy_time::{Duration, Timer};
 use embedded_io_async::Read;
 use embedded_io_async::Write;
 use static_cell::StaticCell;
+use heapless::String;
 use {defmt_rtt as _, panic_probe as _};
 
 // Program metadata
-#[unsafe(link_section = ".bi_entries")]
+#[link_section = ".bi_entries"]
 #[used]
 pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 4] = [
-    embassy_rp::binary_info::rp_program_name!(c"WiFi AP + EC800K Gateway"),
+    embassy_rp::binary_info::rp_program_name!(c"Pico LTE Proxy"),
     embassy_rp::binary_info::rp_program_description!(
-        c"Raspberry Pi Pico 2 W as WiFi AP routing through EC800K 4G module"
+        c"Pico 2W WiFi AP + EC800K LTE HTTP Proxy"
     ),
     embassy_rp::binary_info::rp_cargo_version!(),
     embassy_rp::binary_info::rp_program_build_attribute!(),
@@ -36,8 +37,13 @@ bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
 });
 
-const WIFI_SSID: &str = "Pico2W_Gateway";
+const WIFI_SSID: &str = "PicoLTE";
 const WIFI_PASSWORD: &str = "12345678";
+const UART_BAUDRATE: u32 = 921600;
+
+// Default proxy target
+const DEFAULT_HOST: &str = "www.gzxxzlk.com";
+const DEFAULT_PATH: &str = "/";
 
 #[embassy_executor::task]
 async fn cyw43_task(
@@ -51,715 +57,542 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
     runner.run().await
 }
 
-static EC800K_STATUS: embassy_sync::mutex::Mutex<
+// Global channel for UART communication
+static UART_CHANNEL: embassy_sync::channel::Channel<
     embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
-    &str,
-> = embassy_sync::mutex::Mutex::new("Initializing...");
+    UartRequest,
+    1,
+> = embassy_sync::channel::Channel::new();
 
-static EC800K_BAUD: embassy_sync::mutex::Mutex<
+static UART_RESPONSE: embassy_sync::channel::Channel<
     embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
-    u32,
-> = embassy_sync::mutex::Mutex::new(115200);
+    UartResponse,
+    1,
+> = embassy_sync::channel::Channel::new();
 
-static EC800K_DATA: embassy_sync::mutex::Mutex<
-    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
-    heapless::String<1024>,
-> = embassy_sync::mutex::Mutex::new(heapless::String::new());
+#[derive(Clone)]
+struct UartRequest {
+    host: String<64>,
+    path: String<128>,
+}
 
-static HTTP_RESPONSE: embassy_sync::mutex::Mutex<
-    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
-    heapless::String<2048>,
-> = embassy_sync::mutex::Mutex::new(heapless::String::new());
-
-static HTTP_REQUEST_TRIGGER: embassy_sync::signal::Signal<
-    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
-    bool,
-> = embassy_sync::signal::Signal::new();
-
-static UART_TX_COUNT: embassy_sync::mutex::Mutex<
-    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
-    u32,
-> = embassy_sync::mutex::Mutex::new(0);
-
-static UART_RX_COUNT: embassy_sync::mutex::Mutex<
-    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
-    u32,
-> = embassy_sync::mutex::Mutex::new(0);
+struct UartResponse {
+    data: String<8192>,
+    success: bool,
+}
 
 #[embassy_executor::task]
-async fn http_server_task(stack: &'static Stack<'static>) {
-    // Static IP is already configured, just wait a bit for stack initialization
-    info!("HTTP server task started");
+async fn uart_task(mut uart: BufferedUart<'static, UART0>) {
+    info!("UART task started at {} baud", UART_BAUDRATE);
+
+    // Initialize EC800K
+    Timer::after(Duration::from_secs(2)).await;
+
+    info!("Initializing EC800K...");
+    send_at_command(&mut uart, "AT").await;
     Timer::after(Duration::from_millis(500)).await;
-    info!("Starting HTTP server on 192.168.4.1:80");
 
-    let mut rx_buffer = [0; 16384];
-    let mut tx_buffer = [0; 16384];
-    let mut request_count = 0u32;
+    send_at_command(&mut uart, "AT+CPIN?").await;
+    Timer::after(Duration::from_millis(500)).await;
 
-    loop {
-        let mut socket = TcpSocket::new(*stack, &mut rx_buffer, &mut tx_buffer);
-        socket.set_timeout(Some(Duration::from_secs(30)));
+    send_at_command(&mut uart, "AT+CREG?").await;
+    Timer::after(Duration::from_millis(500)).await;
 
-        info!(
-            "Listening on TCP:80... (requests served: {})",
-            request_count
-        );
-        if let Err(e) = socket.accept(80).await {
-            warn!("Accept error: {:?}", e);
-            Timer::after(Duration::from_millis(100)).await;
-            continue;
-        }
-
-        info!("Received connection from {:?}", socket.remote_endpoint());
-        request_count += 1;
-
-        match handle_client(&mut socket).await {
-            Ok(_) => info!("Request #{} completed successfully", request_count),
-            Err(e) => warn!("Request #{} failed: {:?}", request_count, e),
-        }
-
-        // Ensure socket is fully closed
-        socket.abort();
-        Timer::after(Duration::from_millis(50)).await;
-    }
-}
-
-async fn handle_client(socket: &mut TcpSocket<'_>) -> Result<(), embassy_net::tcp::Error> {
-    let mut buf = [0; 2048];
-
-    // Read request with timeout
-    let n = match embassy_time::with_timeout(Duration::from_secs(5), socket.read(&mut buf)).await {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => {
-            warn!("Read error: {:?}", e);
-            return Err(e);
-        }
-        Err(_) => {
-            warn!("Read timeout");
-            return Ok(());
-        }
-    };
-
-    if n == 0 {
-        info!("Empty request, closing");
-        return Ok(());
-    }
-
-    let request = core::str::from_utf8(&buf[..n]).unwrap_or("");
-    info!("HTTP Request ({} bytes)", n);
-
-    // Parse HTTP request
-    if let Some(first_line) = request.lines().next() {
-        let parts: heapless::Vec<&str, 3> = first_line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            let method = parts[0];
-            let path = parts[1];
-            info!("Method: {}, Path: {}", method, path);
-
-            // Check if trigger button was pressed
-            if path.contains("/trigger") {
-                info!("HTTP request triggered!");
-                HTTP_REQUEST_TRIGGER.signal(true);
-            }
-
-            // Get EC800K status
-            let status = EC800K_STATUS.lock().await;
-            let baud = EC800K_BAUD.lock().await;
-            let data = EC800K_DATA.lock().await;
-            let tx_count = UART_TX_COUNT.lock().await;
-            let rx_count = UART_RX_COUNT.lock().await;
-            let http_resp = HTTP_RESPONSE.lock().await;
-
-            // Build response string
-            let mut response_str = heapless::String::<4096>::new();
-            use core::fmt::Write as _;
-            let _ = core::write!(
-                &mut response_str,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: ",
-            );
-
-            let body = {
-                let mut body_str = heapless::String::<3500>::new();
-                let _ = core::write!(
-                    &mut body_str,
-                    "<html><head><meta http-equiv='refresh' content='5'><title>Pico 2W Gateway</title></head><body>\
-                    <h1>Pico 2W Gateway Status</h1>\
-                    <p><b>EC800K Status:</b> <span style='color:{}'>{}</span></p>\
-                    <p><b>Baud Rate:</b> {} baud</p>\
-                    <p><b>UART TX:</b> {} bytes | <b>RX:</b> {} bytes</p>\
-                    <p><b>Request:</b> {} {}</p>\
-                    <p><b>Network:</b> AP Mode - 192.168.4.1</p>\
-                    <form action='/trigger' method='get'><button type='submit' style='padding:10px 20px;font-size:16px;background:#4CAF50;color:white;border:none;cursor:pointer'>Fetch httpbin.org/get</button></form>\
-                    <hr>\
-                    <h2>HTTP Test (httpbin.org/get):</h2>\
-                    <pre style='background:#e8f4f8;padding:10px;overflow:auto;max-height:300px;font-size:12px'>{}</pre>\
-                    <hr>\
-                    <h2>EC800K Data Log:</h2>\
-                    <pre style='background:#f0f0f0;padding:10px;overflow:auto;max-height:400px;font-size:12px'>{}</pre>\
-                    <p><small>Auto-refresh: 5s | China Telecom APN: ctnet</small></p>\
-                    <p style='color:#666'><small>Debug: If RX=0, check UART wiring (GP0→EC800K_RX, GP1→EC800K_TX, GND)</small></p>\
-                    </body></html>",
-                    if status.contains("ERROR") {
-                        "red"
-                    } else if status.contains("complete") {
-                        "green"
-                    } else {
-                        "orange"
-                    },
-                    *status,
-                    *baud,
-                    *tx_count,
-                    *rx_count,
-                    method,
-                    path,
-                    if http_resp.is_empty() {
-                        "[No HTTP response yet - waiting for EC800K to fetch data...]"
-                    } else {
-                        http_resp.as_str()
-                    },
-                    if data.is_empty() {
-                        "[No data received - Check UART connection]"
-                    } else {
-                        data.as_str()
-                    }
-                );
-                body_str
-            };
-
-            let _ = core::write!(&mut response_str, "{}\r\n\r\n{}", body.len(), body.as_str());
-
-            // Write response
-            info!("Sending response ({} bytes)", response_str.len());
-            socket.write_all(response_str.as_bytes()).await?;
-            socket.flush().await?;
-            info!("Response sent successfully");
-        }
-    }
-
-    Timer::after(Duration::from_millis(100)).await;
-    Ok(())
-}
-
-#[embassy_executor::task]
-async fn uart_task(mut tx: BufferedUartTx, mut rx: BufferedUartRx, baud_rate: u32) {
-    info!("UART task started - Testing EC800K connection");
-
-    // Update baud rate status
-    {
-        let mut baud = EC800K_BAUD.lock().await;
-        *baud = baud_rate;
-    }
-
-    // Add diagnostic data immediately
-    {
-        let mut data = EC800K_DATA.lock().await;
-        let _ = data.push_str("=== UART Task Started ===\n");
-        let _ = core::fmt::Write::write_fmt(
-            &mut *data,
-            format_args!("Baud: {} | Pins: GP0(TX), GP1(RX)\n", baud_rate),
-        );
-        let _ = data.push_str("Waiting for modem to stabilize...\n");
-    }
-
-    {
-        let mut status = EC800K_STATUS.lock().await;
-        *status = "Waiting for modem...";
-    }
-
-    // Wait for modem to boot and clear RDY messages
-    Timer::after(Duration::from_secs(3)).await;
-
-    // Clear any pending RDY messages
-    let mut buf = [0u8; 512];
-    for _ in 0..10 {
-        match rx.read(&mut buf).await {
-            Ok(n) if n > 0 => {
-                if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-                    info!("Clearing boot messages: {}", s);
-                }
-            }
-            _ => break,
-        }
-        Timer::after(Duration::from_millis(100)).await;
-    }
-
-    {
-        let mut status = EC800K_STATUS.lock().await;
-        *status = "Testing AT command...";
-    }
-
-    {
-        let mut data = EC800K_DATA.lock().await;
-        let _ = data.push_str("Modem ready, starting init...\n");
-    }
-
-    // Simple AT test first
-    info!("Sending test AT command");
-    {
-        let mut data = EC800K_DATA.lock().await;
-        let _ = data.push_str(">> AT\\r\\n\n");
-    }
-
-    let test_at = b"AT\r\n";
-    let _ = tx.write_all(test_at).await;
-    {
-        let mut tx_count = UART_TX_COUNT.lock().await;
-        *tx_count += test_at.len() as u32;
-    }
-    info!("AT command sent ({} bytes)", test_at.len());
-
+    send_at_command(&mut uart, "AT+CGATT=1").await;
     Timer::after(Duration::from_secs(1)).await;
 
-    // Check for response
-    let mut buf = [0u8; 256];
-    let mut got_response = false;
-    for attempt in 0..5 {
-        match rx.read(&mut buf).await {
-            Ok(n) if n > 0 => {
-                got_response = true;
-                let mut rx_count = UART_RX_COUNT.lock().await;
-                *rx_count += n as u32;
-
-                if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-                    info!("GOT RESPONSE: {}", s);
-                    let mut data = EC800K_DATA.lock().await;
-                    let _ = data.push_str("<< ");
-                    let _ = data.push_str(s);
-                    let _ = data.push_str("\n");
-                }
-                break;
-            }
-            _ => {
-                info!("Read attempt {}: no data", attempt + 1);
-            }
-        }
-        Timer::after(Duration::from_millis(200)).await;
-    }
-
-    if !got_response {
-        warn!("NO RESPONSE from EC800K after AT command!");
-        let mut status = EC800K_STATUS.lock().await;
-        *status = "ERROR: No response (check wiring)";
-        let mut data = EC800K_DATA.lock().await;
-        let _ = data.push_str("!! NO RESPONSE - Check:\n");
-        let _ = data.push_str("  1. EC800K powered on?\n");
-        let _ = data.push_str("  2. GP0 -> EC800K RX\n");
-        let _ = data.push_str("  3. GP1 -> EC800K TX\n");
-        let _ = data.push_str("  4. GND connected\n");
-        let _ = data.push_str("  5. Try 115200 baud\n");
-
-        // Keep trying to read
-        loop {
-            match rx.read(&mut buf).await {
-                Ok(n) if n > 0 => {
-                    if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-                        info!("Late response: {}", s);
-                        let mut data = EC800K_DATA.lock().await;
-                        let _ = data.push_str("<< LATE: ");
-                        let _ = data.push_str(s);
-                    }
-                }
-                _ => {}
-            }
-            Timer::after(Duration::from_secs(1)).await;
-        }
-    }
-
-    {
-        let mut status = EC800K_STATUS.lock().await;
-        *status = "AT OK - Initializing modem...";
-    }
-
-    // Initialize EC800K modem for China Telecom
-    let init_commands: &[&[u8]] = &[
-        b"AT\r\n",                            // Test AT
-        b"ATE0\r\n",                          // Disable echo
-        b"AT+CPIN?\r\n",                      // Check SIM
-        b"AT+CREG?\r\n",                      // Check network registration
-        b"AT+CGATT=1\r\n",                    // Attach to GPRS
-        b"AT+CGDCONT=1,\"IP\",\"ctnet\"\r\n", // China Telecom APN
-        b"AT+QIACT=1\r\n",                    // Activate PDP context
-        b"AT+QIACT?\r\n",                     // Query IP address
-    ];
-
-    for cmd in init_commands {
-        info!("Sending: {}", core::str::from_utf8(*cmd).unwrap_or(""));
-        let _ = tx.write_all(*cmd).await;
-
-        {
-            let mut tx_count = UART_TX_COUNT.lock().await;
-            *tx_count += cmd.len() as u32;
-        }
-
-        Timer::after(Duration::from_millis(500)).await;
-
-        // Read response
-        let mut buf = [0u8; 512];
-        let mut total_read = 0;
-        let mut got_response = false;
-        for _ in 0..20 {
-            match rx.read(&mut buf[total_read..]).await {
-                Ok(n) if n > 0 => {
-                    total_read += n;
-                    got_response = true;
-
-                    let mut rx_count = UART_RX_COUNT.lock().await;
-                    *rx_count += n as u32;
-
-                    if let Ok(s) = core::str::from_utf8(&buf[..total_read]) {
-                        info!("Response: {}", s);
-
-                        // Log to web interface
-                        let mut data = EC800K_DATA.lock().await;
-                        let _ = data.push_str("<< ");
-                        let _ = data.push_str(s);
-
-                        if s.contains("OK") || s.contains("ERROR") {
-                            break;
-                        }
-                    }
-                }
-                _ => break,
-            }
-            Timer::after(Duration::from_millis(100)).await;
-        }
-
-        if !got_response {
-            let mut status = EC800K_STATUS.lock().await;
-            *status = "ERROR: No response during init";
-        }
-    }
-
-    {
-        let mut status = EC800K_STATUS.lock().await;
-        *status = "Ready - Click button to test";
-    }
-
-    info!("EC800K initialization complete - Waiting for button press");
-
-    // Wait for user to trigger HTTP request
-    info!("Waiting for HTTP request trigger...");
-    HTTP_REQUEST_TRIGGER.wait().await;
-    info!("HTTP request triggered by user!");
-
+    send_at_command(&mut uart, "AT+QICSGP=1,1,\"CTNET\"").await;
     Timer::after(Duration::from_millis(500)).await;
 
-    {
-        let mut data = EC800K_DATA.lock().await;
-        let _ = data.push_str("\n=== TCP HTTP TEST ===\n");
-    }
+    send_at_command(&mut uart, "AT+QIACT=1").await;
+    Timer::after(Duration::from_secs(2)).await;
 
-    {
-        let mut status = EC800K_STATUS.lock().await;
-        *status = "Opening TCP connection...";
-    }
-
-    // Open TCP connection to httpbin.org:80
-    info!("Opening TCP connection to httpbin.org");
-    let tcp_open = b"AT+QIOPEN=1,0,\"TCP\",\"httpbin.org\",80,0,1\r\n";
-    let _ = tx.write_all(tcp_open).await;
-    {
-        let mut tx_count = UART_TX_COUNT.lock().await;
-        *tx_count += tcp_open.len() as u32;
-    }
-
-    // Read initial OK response
-    let mut buf = [0u8; 512];
+    send_at_command(&mut uart, "AT+QIACT?").await;
     Timer::after(Duration::from_millis(500)).await;
 
-    for _ in 0..5 {
-        match rx.read(&mut buf).await {
-            Ok(n) if n > 0 => {
-                let mut rx_count = UART_RX_COUNT.lock().await;
-                *rx_count += n as u32;
-                drop(rx_count);
-                if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-                    info!("Initial response: {}", s);
-                    let mut data = EC800K_DATA.lock().await;
-                    let _ = data.push_str("<< ");
-                    let _ = data.push_str(s);
-                }
-                break;
-            }
-            _ => {}
-        }
-        Timer::after(Duration::from_millis(100)).await;
+    send_at_command(&mut uart, "AT+QIDNSCFG=1,\"114.114.114.114\",\"8.8.8.8\"").await;
+    Timer::after(Duration::from_millis(500)).await;
+
+    info!("EC800K initialized successfully!");
+
+    // Main loop - wait for HTTP requests
+    loop {
+        let request = UART_CHANNEL.receive().await;
+        info!("Received request for {}:{}", request.host.as_str(), request.path.as_str());
+
+        let result = fetch_via_lte(&mut uart, &request.host, &request.path).await;
+
+        UART_RESPONSE.send(result).await;
     }
+}
 
-    // Now wait for +QIOPEN URC (can take several seconds)
-    info!("Waiting for +QIOPEN connection result...");
-    Timer::after(Duration::from_secs(3)).await;
+async fn send_at_command(uart: &mut BufferedUart<'static, UART0>, cmd: &str) {
+    let mut cmd_buf = String::<256>::new();
+    let _ = cmd_buf.push_str(cmd);
+    let _ = cmd_buf.push_str("\r\n");
 
+    info!("TX: {}", cmd);
+    let _ = uart.write_all(cmd_buf.as_bytes()).await;
+
+    // Read response
+    let mut response = [0u8; 512];
+    Timer::after(Duration::from_millis(100)).await;
+
+    if let Ok(n) = embassy_time::with_timeout(
+        Duration::from_secs(2),
+        uart.read(&mut response)
+    ).await {
+        if let Ok(resp_str) = core::str::from_utf8(&response[..n]) {
+            info!("RX: {}", resp_str.trim());
+        }
+    }
+}
+
+async fn clear_uart_buffer(uart: &mut BufferedUart<'static, UART0>) {
+    Timer::after(Duration::from_millis(500)).await;
+    let mut discard = [0u8; 256];
+    while let Ok(_) = embassy_time::with_timeout(
+        Duration::from_millis(100),
+        uart.read(&mut discard)
+    ).await {}
+}
+
+async fn fetch_via_lte(
+    uart: &mut BufferedUart<'static, UART0>,
+    host: &str,
+    path: &str,
+) -> UartResponse {
+    info!("Fetching http://{}{} via LTE...", host, path);
+
+    // Clear buffer
+    clear_uart_buffer(uart).await;
+
+    // Step 1: Open TCP connection
+    info!("1. Opening TCP connection...");
+    let mut open_cmd = String::<256>::new();
+    let _ = write!(&mut open_cmd, "AT+QIOPEN=1,0,\"TCP\",\"{}\",80,0,1\r\n", host);
+    let _ = uart.write_all(open_cmd.as_bytes()).await;
+
+    // Wait for +QIOPEN: 0,0
+    let mut response = [0u8; 256];
     let mut connected = false;
-    for _ in 0..100 {
-        match rx.read(&mut buf).await {
-            Ok(n) if n > 0 => {
-                let mut rx_count = UART_RX_COUNT.lock().await;
-                *rx_count += n as u32;
-                drop(rx_count);
-                if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-                    info!("TCP connection status: {}", s);
-                    let mut data = EC800K_DATA.lock().await;
-                    let _ = data.push_str("<< ");
-                    let _ = data.push_str(s);
-
-                    // +QIOPEN: 0,0 means context 0, error 0 (success)
-                    if s.contains("+QIOPEN: 0,0") {
-                        connected = true;
-                        info!("TCP connection established!");
-                        break;
-                    }
-                    // Check for error codes
-                    if s.contains("+QIOPEN:") && !s.contains(",0") {
-                        info!("TCP connection failed");
-                        break;
-                    }
+    for _ in 0..20 {
+        Timer::after(Duration::from_millis(500)).await;
+        if let Ok(n) = embassy_time::with_timeout(
+            Duration::from_millis(500),
+            uart.read(&mut response)
+        ).await {
+            if let Ok(resp_str) = core::str::from_utf8(&response[..n]) {
+                info!("Open response: {}", resp_str);
+                if resp_str.contains("+QIOPEN: 0,0") {
+                    connected = true;
+                    break;
                 }
             }
-            _ => {}
         }
-        Timer::after(Duration::from_millis(200)).await;
     }
 
     if !connected {
-        let mut status = EC800K_STATUS.lock().await;
-        *status = "TCP connection failed";
-        info!("TCP connection failed");
-    } else {
-        info!("TCP connected, sending HTTP request");
-
-        {
-            let mut status = EC800K_STATUS.lock().await;
-            *status = "TCP connected, sending request...";
-        }
-
-        // Send HTTP GET request via TCP
-        let http_request = b"GET /get HTTP/1.1\r\nHost: httpbin.org\r\nConnection: close\r\n\r\n";
-
-        let mut len_str = heapless::String::<8>::new();
-        use core::fmt::Write as _;
-        let _ = core::write!(&mut len_str, "{}", http_request.len());
-
-        let send_cmd = b"AT+QISEND=0,";
-        let _ = tx.write_all(send_cmd).await;
-        let _ = tx.write_all(len_str.as_bytes()).await;
-        let _ = tx.write_all(b"\r\n").await;
-
-        {
-            let mut tx_count = UART_TX_COUNT.lock().await;
-            *tx_count += send_cmd.len() as u32 + len_str.len() as u32 + 2;
-        }
-
-        Timer::after(Duration::from_millis(500)).await;
-
-        // Wait for '>'
-        for _ in 0..10 {
-            match rx.read(&mut buf).await {
-                Ok(n) if n > 0 => {
-                    let mut rx_count = UART_RX_COUNT.lock().await;
-                    *rx_count += n as u32;
-                    drop(rx_count);
-                    if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-                        let mut data = EC800K_DATA.lock().await;
-                        let _ = data.push_str("<< ");
-                        let _ = data.push_str(s);
-                        if s.contains(">") {
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            }
-            Timer::after(Duration::from_millis(50)).await;
-        }
-
-        // Send actual HTTP request
-        let _ = tx.write_all(http_request).await;
-        {
-            let mut tx_count = UART_TX_COUNT.lock().await;
-            *tx_count += http_request.len() as u32;
-        }
-
-        Timer::after(Duration::from_secs(2)).await;
-
-        // Read HTTP response
-        {
-            let mut status = EC800K_STATUS.lock().await;
-            *status = "Receiving HTTP response...";
-        }
-
-        for _ in 0..200 {
-            match rx.read(&mut buf).await {
-                Ok(n) if n > 0 => {
-                    let mut rx_count = UART_RX_COUNT.lock().await;
-                    *rx_count += n as u32;
-                    drop(rx_count);
-
-                    if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-                        info!("HTTP response chunk: {}", s);
-
-                        let mut http_resp = HTTP_RESPONSE.lock().await;
-                        let _ = http_resp.push_str(s);
-
-                        let mut data = EC800K_DATA.lock().await;
-                        let _ = data.push_str("<< ");
-                        let _ = data.push_str(s);
-                    }
-                }
-                _ => {}
-            }
-            Timer::after(Duration::from_millis(100)).await;
-        }
-
-        // Close connection
-        let close_cmd = b"AT+QICLOSE=0\r\n";
-        let _ = tx.write_all(close_cmd).await;
-        {
-            let mut tx_count = UART_TX_COUNT.lock().await;
-            *tx_count += close_cmd.len() as u32;
-        }
-
-        let mut status = EC800K_STATUS.lock().await;
-        *status = "HTTP test complete!";
+        warn!("TCP connection failed");
+        return UartResponse {
+            data: String::from_str("TCP connection failed").unwrap_or_default(),
+            success: false,
+        };
     }
 
-    // Continue reading responses and log to web interface
-    let mut buf = [0u8; 512];
-    loop {
-        match rx.read(&mut buf).await {
-            Ok(n) if n > 0 => {
-                let mut rx_count = UART_RX_COUNT.lock().await;
-                *rx_count += n as u32;
+    info!("✅ TCP connected");
+    Timer::after(Duration::from_secs(1)).await;
 
-                if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-                    info!("EC800K: {}", s);
+    // Step 2: Prepare HTTP request
+    let mut http_request = String::<512>::new();
+    let _ = write!(&mut http_request,
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: PicoLTE-Proxy/1.0\r\n\r\n",
+        path, host
+    );
 
-                    // Update the data log for web display
-                    let mut data = EC800K_DATA.lock().await;
-                    // Keep last 800 chars to prevent overflow
-                    if data.len() > 800 {
-                        let start = data.len() - 600;
-                        let mut tail_buf = heapless::String::<600>::new();
-                        let _ = tail_buf.push_str(&data[start..]);
-                        data.clear();
-                        let _ = data.push_str("...[truncated]...\n");
-                        let _ = data.push_str(tail_buf.as_str());
-                    }
-                    let _ = data.push_str("<< ");
-                    let _ = data.push_str(s);
+    // Step 3: Send HTTP data
+    info!("2. Sending HTTP request...");
+    let mut send_cmd = String::<64>::new();
+    let _ = write!(&mut send_cmd, "AT+QISEND=0,{}\r\n", http_request.len());
+    let _ = uart.write_all(send_cmd.as_bytes()).await;
+
+    // Wait for '>'
+    Timer::after(Duration::from_millis(500)).await;
+    let mut got_prompt = false;
+    if let Ok(n) = embassy_time::with_timeout(
+        Duration::from_secs(5),
+        uart.read(&mut response)
+    ).await {
+        if let Ok(resp_str) = core::str::from_utf8(&response[..n]) {
+            if resp_str.contains(">") {
+                got_prompt = true;
+            }
+        }
+    }
+
+    if !got_prompt {
+        warn!("No send prompt received");
+        let _ = uart.write_all(b"AT+QICLOSE=0\r\n").await;
+        return UartResponse {
+            data: String::from_str("No send prompt").unwrap_or_default(),
+            success: false,
+        };
+    }
+
+    // Send actual HTTP data
+    let _ = uart.write_all(http_request.as_bytes()).await;
+    Timer::after(Duration::from_millis(500)).await;
+
+    // Wait for SEND OK
+    info!("3. Waiting for SEND OK...");
+    let mut got_send_ok = false;
+    for _ in 0..10 {
+        if let Ok(n) = embassy_time::with_timeout(
+            Duration::from_millis(500),
+            uart.read(&mut response)
+        ).await {
+            if let Ok(resp_str) = core::str::from_utf8(&response[..n]) {
+                if resp_str.contains("SEND OK") {
+                    got_send_ok = true;
+                    info!("✅ SEND OK received");
+                    break;
                 }
             }
-            _ => {}
         }
         Timer::after(Duration::from_millis(100)).await;
     }
+
+    if !got_send_ok {
+        warn!("SEND OK not received");
+    }
+
+    // Step 4: Collect HTTP response
+    info!("4. Collecting HTTP response...");
+    let mut http_data = String::<8192>::new();
+    let mut buffer = [0u8; 512];
+    let mut no_data_count = 0;
+
+    for _ in 0..60 {  // 30 seconds max
+        match embassy_time::with_timeout(
+            Duration::from_millis(500),
+            uart.read(&mut buffer)
+        ).await {
+            Ok(n) => {
+                if let Ok(chunk) = core::str::from_utf8(&buffer[..n]) {
+                    let _ = http_data.push_str(chunk);
+                    no_data_count = 0;
+
+                    // Check if we have complete response
+                    if http_data.contains("</html>") || http_data.contains("</HTML>") {
+                        info!("✅ Complete response detected");
+                        break;
+                    }
+                }
+            }
+            Err(_) => {
+                no_data_count += 1;
+                if no_data_count > 6 && http_data.len() > 0 {
+                    info!("✅ No more data");
+                    break;
+                }
+            }
+        }
+    }
+
+    info!("Total response: {} bytes", http_data.len());
+
+    // Step 5: Close connection
+    info!("5. Closing connection...");
+    let _ = uart.write_all(b"AT+QICLOSE=0\r\n").await;
+    Timer::after(Duration::from_millis(500)).await;
+
+    UartResponse {
+        data: http_data,
+        success: true,
+    }
+}
+
+#[embassy_executor::task]
+async fn http_server_task(stack: &'static Stack<cyw43::NetDriver<'static>>) {
+    info!("HTTP server starting...");
+    Timer::after(Duration::from_secs(1)).await;
+
+    let mut rx_buffer = [0; 4096];
+    let mut tx_buffer = [0; 4096];
+
+    loop {
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(Duration::from_secs(30)));
+
+        info!("Listening on port 80...");
+        if let Err(e) = socket.accept(80).await {
+            warn!("Accept error: {:?}", e);
+            continue;
+        }
+
+        info!("Client connected!");
+
+        // Read HTTP request
+        let mut request_buf = [0u8; 1024];
+        let mut total_read = 0;
+
+        loop {
+            match socket.read(&mut request_buf[total_read..]).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    total_read += n;
+                    if total_read >= request_buf.len()
+                        || request_buf[..total_read].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        if total_read == 0 {
+            warn!("No data received");
+            continue;
+        }
+
+        let request_str = match core::str::from_utf8(&request_buf[..total_read]) {
+            Ok(s) => s,
+            Err(_) => {
+                warn!("Invalid UTF-8");
+                continue;
+            }
+        };
+
+        info!("Request: {}", request_str.split("\r\n").next().unwrap_or(""));
+
+        // Parse request
+        let (host, path) = if request_str.starts_with("GET /proxy?url=") {
+            // Parse URL parameter
+            if let Some(url_start) = request_str.find("url=http://") {
+                let url_part = &request_str[url_start + 11..];
+                if let Some(url_end) = url_part.find(|c: char| c.is_whitespace() || c == '&') {
+                    let full_url = &url_part[..url_end];
+                    if let Some(slash_pos) = full_url.find('/') {
+                        let h = &full_url[..slash_pos];
+                        let p = &full_url[slash_pos..];
+                        (String::<64>::from_str(h).ok(), String::<128>::from_str(p).ok())
+                    } else {
+                        (String::<64>::from_str(full_url).ok(), Some(String::<128>::from_str("/").unwrap()))
+                    }
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            // Default to www.gzxxzlk.com
+            (
+                String::<64>::from_str(DEFAULT_HOST).ok(),
+                String::<128>::from_str(DEFAULT_PATH).ok()
+            )
+        };
+
+        let response = if let (Some(h), Some(p)) = (host, path) {
+            info!("Proxying: {}:{}", h.as_str(), p.as_str());
+
+            // Send request to UART task
+            UART_CHANNEL.send(UartRequest {
+                host: h.clone(),
+                path: p.clone(),
+            }).await;
+
+            // Wait for response
+            let uart_resp = UART_RESPONSE.receive().await;
+
+            if uart_resp.success {
+                // Extract HTML content
+                let html_content = extract_html(&uart_resp.data);
+
+                if html_content.len() > 0 {
+                    info!("✅ Sending {} bytes to browser", html_content.len());
+                    format_http_response(&html_content, "text/html")
+                } else {
+                    info!("⚠️ No HTML content found");
+                    format_error_response("No HTML content found in response")
+                }
+            } else {
+                format_error_response(uart_resp.data.as_str())
+            }
+        } else {
+            format_error_response("Invalid URL format. Use /proxy?url=http://example.com")
+        };
+
+        // Send response
+        if let Err(e) = socket.write_all(response.as_bytes()).await {
+            warn!("Write error: {:?}", e);
+        }
+
+        socket.close();
+        Timer::after(Duration::from_millis(100)).await;
+    }
+}
+
+fn extract_html(data: &str) -> String<8192> {
+    let mut result = String::<8192>::new();
+
+    // Find header end
+    if let Some(header_end) = data.find("\r\n\r\n") {
+        let _ = result.push_str(&data[header_end + 4..]);
+    } else if let Some(html_start) = data.find("<!DOCTYPE") {
+        let _ = result.push_str(&data[html_start..]);
+    } else if let Some(html_start) = data.find("<html") {
+        let _ = result.push_str(&data[html_start..]);
+    } else if let Some(body_start) = data.find("<body") {
+        let _ = result.push_str(&data[body_start..]);
+    } else {
+        let _ = result.push_str(data);
+    }
+
+    // Clean AT command artifacts
+    let artifacts = ["AT+", "+QI", "SEND OK", "OK\r\n"];
+    for artifact in &artifacts {
+        if let Some(pos) = result.find(artifact) {
+            result.truncate(pos);
+            break;
+        }
+    }
+
+    result
+}
+
+fn format_http_response(content: &str) -> String<8192> {
+    let mut response = String::<8192>::new();
+    let _ = write!(&mut response,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{}",
+        content
+    );
+    response
+}
+
+fn format_error_response(error: &str) -> String<8192> {
+    let mut response = String::<8192>::new();
+    let _ = write!(&mut response,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+        <!DOCTYPE html>\
+        <html>\
+        <head><title>Pico LTE Proxy - Error</title>\
+        <style>body{{font-family:Arial,sans-serif;margin:40px;}}\
+        .error{{color:red;background:#ffe6e6;padding:15px;border-radius:5px;}}</style>\
+        </head>\
+        <body>\
+        <h1>Pico LTE Proxy</h1>\
+        <div class=\"error\"><h2>Error</h2><p>{}</p></div>\
+        <p>Baud rate: <strong>921600</strong></p>\
+        <p>Try: <a href=\"/\">Auto-proxy www.gzxxzlk.com</a></p>\
+        <p>Or: /proxy?url=http://example.com</p>\
+        </body></html>",
+        error
+    );
+    response
 }
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
-    // Initialize firmware blobs
+    info!("=== Pico 2W LTE Proxy ===");
+    info!("WiFi AP: {} / {}", WIFI_SSID, WIFI_PASSWORD);
+    info!("UART: {} baud on GP12/GP13", UART_BAUDRATE);
+
+    // Initialize WiFi
     let fw = include_bytes!("../cyw43-firmware/43439A0.bin");
     let clm = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
 
-    // Initialize CYW43 WiFi chip
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
     let mut pio = Pio::new(p.PIO0, Irqs);
     let spi = PioSpi::new(
         &mut pio.common,
         pio.sm0,
-        RM2_CLOCK_DIVIDER,
         pio.irq0,
         cs,
         p.PIN_24,
         p.PIN_29,
         p.DMA_CH0,
+        RM2_CLOCK_DIVIDER,
     );
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
     let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
-    spawner.spawn(cyw43_task(runner).unwrap());
+    spawner.spawn(cyw43_task(runner)).unwrap();
 
+    // Start WiFi AP
     control.init(clm).await;
     control
-        .set_power_management(cyw43::PowerManagementMode::Performance)
+        .start_ap_open(WIFI_SSID, 5)
         .await;
 
-    // Initialize UART for EC800K
-    // GP0 = TX (to EC800K RX)
-    // GP1 = RX (from EC800K TX)
+    info!("WiFi AP started!");
 
-    static UART_TX_BUF: StaticCell<[u8; 2048]> = StaticCell::new();
-    static UART_RX_BUF: StaticCell<[u8; 2048]> = StaticCell::new();
-    let uart_tx_buf = UART_TX_BUF.init([0u8; 2048]);
-    let uart_rx_buf = UART_RX_BUF.init([0u8; 2048]);
+    // Configure network stack with static IP
+    let config = Config::ipv4_static(embassy_net::StaticConfigV4 {
+        address: embassy_net::Ipv4Cidr::new(embassy_net::Ipv4Address::new(192, 168, 4, 1), 24),
+        dns_servers: heapless::Vec::new(),
+        gateway: None,
+    });
+
+    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    let resources = RESOURCES.init(StackResources::new());
+
+    static STACK: StaticCell<Stack<cyw43::NetDriver<'static>>> = StaticCell::new();
+    let stack = STACK.init(Stack::new(net_device, config, resources, embassy_rp::clocks::RoscRng));
+
+    spawner.spawn(net_task(stack.run())).unwrap();
+
+    info!("Network stack initialized at 192.168.4.1");
+
+    // Initialize UART for EC800K
+    let uart_tx_buf = {
+        static BUF: StaticCell<[u8; 256]> = StaticCell::new();
+        BUF.init([0; 256])
+    };
+    let uart_rx_buf = {
+        static BUF: StaticCell<[u8; 256]> = StaticCell::new();
+        BUF.init([0; 256])
+    };
 
     let mut uart_config = UartConfig::default();
-    // Manual testing: Try 115200, 230400, 460800, 921600
-    // Change this value, rebuild, and see if EC800K responds in logs
-    uart_config.baudrate = 115200; // Lowered to 115200 for stability
+    uart_config.baudrate = UART_BAUDRATE;
 
     let uart = BufferedUart::new(
         p.UART0,
-        p.PIN_0,
-        p.PIN_1,
         Irqs,
+        p.PIN_12,  // TX
+        p.PIN_13,  // RX
         uart_tx_buf,
         uart_rx_buf,
         uart_config,
     );
 
-    let (uart_tx, uart_rx) = uart.split();
+    spawner.spawn(uart_task(uart)).unwrap();
 
-    spawner.spawn(uart_task(uart_tx, uart_rx, uart_config.baudrate).unwrap());
+    info!("UART initialized");
 
-    // Configure network stack for AP mode with static IP
-    // Note: Clients must manually configure IP (192.168.4.2-254) as there's no DHCP server
-    let config = Config::ipv4_static(embassy_net::StaticConfigV4 {
-        address: embassy_net::Ipv4Cidr::new(embassy_net::Ipv4Address::new(192, 168, 4, 1), 24),
-        gateway: Some(embassy_net::Ipv4Address::new(192, 168, 4, 1)),
-        dns_servers: heapless::Vec::new(),
-    });
+    // Start HTTP server
+    spawner.spawn(http_server_task(stack)).unwrap();
 
-    let seed = 0x0123_4567_89ab_cdef; // Random seed for network stack
+    info!("=" .repeat(50));
+    info!("🚀 Auto-Proxy Ready!");
+    info!("Connect to WiFi: {}", WIFI_SSID);
+    info!("Open: http://192.168.4.1");
+    info!("This will automatically show: {}", DEFAULT_HOST);
+    info!("For other sites: http://192.168.4.1/proxy?url=http://example.com");
+    info!("=" .repeat(50));
 
-    static STACK: StaticCell<Stack<'static>> = StaticCell::new();
-    static RESOURCES: StaticCell<StackResources<16>> = StaticCell::new();
-    let (stack, runner) = embassy_net::new(
-        net_device,
-        config,
-        RESOURCES.init(StackResources::<16>::new()),
-        seed,
-    );
-    let stack = STACK.init(stack);
-
-    spawner.spawn(net_task(runner).unwrap());
-
-    // Start WiFi AP first
-    info!("Starting WiFi AP...");
-    info!("SSID: {}, Password: {}", WIFI_SSID, WIFI_PASSWORD);
-
-    control.start_ap_wpa2(WIFI_SSID, WIFI_PASSWORD, 5).await;
-    info!("AP started successfully!");
-
-    // Wait for network stack to be fully ready
-    Timer::after(Duration::from_secs(3)).await;
-    info!("Network stack ready");
-
-    // Spawn HTTP server
-    info!("Starting HTTP server on port 80...");
-    spawner.spawn(http_server_task(stack).unwrap());
-    info!("HTTP server task spawned");
-
-    // Blink LED to indicate AP is running
+    // Keep LED blinking to show alive
     loop {
         control.gpio_set(0, true).await;
-        Timer::after(Duration::from_millis(100)).await;
+        Timer::after(Duration::from_secs(1)).await;
         control.gpio_set(0, false).await;
-        Timer::after(Duration::from_millis(900)).await;
+        Timer::after(Duration::from_secs(1)).await;
     }
 }
+
+use core::fmt::Write;
