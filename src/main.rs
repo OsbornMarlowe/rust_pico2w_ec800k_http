@@ -561,10 +561,17 @@ async fn main(spawner: Spawner) {
     static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
     let resources = RESOURCES.init(StackResources::new());
 
-    let (stack, mut runner) = embassy_net::new(net_device, config, resources, embassy_rp::clocks::RoscRng.next_u64());
-    spawner.spawn(unwrap!(net_task(&mut runner)));
+    let (stack, runner) = embassy_net::new(net_device, config, resources, embassy_rp::clocks::RoscRng.next_u64());
 
-    let stack = &stack;
+    static STACK_STORAGE: StaticCell<embassy_net::Stack<'static>> = StaticCell::new();
+    let stack = STACK_STORAGE.init(stack);
+
+    static RUNNER_STORAGE: StaticCell<embassy_net::Runner<'static, cyw43::NetDriver<'static>>> = StaticCell::new();
+    let runner = RUNNER_STORAGE.init(runner);
+
+    spawner.spawn(unwrap!(net_task(runner)));
+
+    let stack = stack;
 
     info!("Network stack initialized at 192.168.4.1");
 
