@@ -5,7 +5,7 @@ use cyw43_pio::PioSpi;
 use defmt::*;
 use core::fmt::Write as FmtWrite;
 use embassy_executor::Spawner;
-use embassy_net::{Config, Stack, StackResources};
+use embassy_net::{Config, StackResources};
 
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
@@ -45,7 +45,7 @@ async fn cyw43_task(
 }
 
 #[embassy_executor::task]
-async fn net_task(runner: &'static embassy_net::Runner<'static>) -> ! {
+async fn net_task(runner: &'static embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
     runner.run().await
 }
 
@@ -535,6 +535,7 @@ async fn main(spawner: Spawner) {
         cyw43_pio::DEFAULT_CLOCK_DIVIDER,
         pio.irq0,
         cs,
+        p.PIN_24,
         p.PIN_29,
         p.DMA_CH0,
     );
@@ -542,7 +543,7 @@ async fn main(spawner: Spawner) {
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
     let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
-    unwrap!(spawner.spawn(cyw43_task(runner)));
+    spawner.spawn(cyw43_task(runner)).expect("spawn cyw43_task");
 
     // Start WiFi AP
     control.init(clm).await;
@@ -560,8 +561,8 @@ async fn main(spawner: Spawner) {
     static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
     let resources = RESOURCES.init(StackResources::new());
 
-    let (stack, runner) = embassy_net::new(net_device, config, resources, embassy_rp::clocks::RoscRng::new());
-    unwrap!(spawner.spawn(net_task(&runner)));
+    let (stack, runner) = embassy_net::new(net_device, config, resources, embassy_rp::clocks::RoscRng);
+    spawner.spawn(net_task(&runner)).expect("spawn net_task");
 
     let stack = &stack;
 
@@ -590,12 +591,12 @@ async fn main(spawner: Spawner) {
         uart_config,
     );
 
-    unwrap!(spawner.spawn(uart_task(uart)));
+    spawner.spawn(uart_task(uart)).expect("spawn uart_task");
 
     info!("UART initialized");
 
     // Start HTTP server
-    unwrap!(spawner.spawn(http_server_task(stack)));
+    spawner.spawn(http_server_task(stack)).expect("spawn http_server_task");
 
     info!("==================================================");
     info!("🚀 Auto-Proxy Ready!");
