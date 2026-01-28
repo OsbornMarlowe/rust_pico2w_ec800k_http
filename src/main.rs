@@ -6,7 +6,7 @@ use defmt::*;
 use core::fmt::Write as FmtWrite;
 use embassy_executor::Spawner;
 use embassy_net::{Config, Stack, StackResources};
-use embassy_net::tcp::TcpSocket;
+
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0, UART0};
@@ -45,7 +45,7 @@ async fn cyw43_task(
 }
 
 #[embassy_executor::task]
-async fn net_task(stack: &'static Stack<'_>) -> ! {
+async fn net_task(stack: &'static Stack<'static>) -> ! {
     stack.run().await
 }
 
@@ -74,7 +74,7 @@ struct UartResponse {
 }
 
 #[embassy_executor::task]
-async fn uart_task(mut uart: BufferedUart<'static>) {
+async fn uart_task(mut uart: BufferedUart) {
     info!("UART task started at {} baud", UART_BAUDRATE);
 
     // Initialize EC800K
@@ -122,7 +122,7 @@ async fn uart_task(mut uart: BufferedUart<'static>) {
     }
 }
 
-async fn send_at_command(uart: &mut BufferedUart<'static>, cmd: &str) {
+async fn send_at_command(uart: &mut BufferedUart, cmd: &str) {
     let mut cmd_buf = String::<256>::new();
     let _ = cmd_buf.push_str(cmd);
     let _ = cmd_buf.push_str("\r\n");
@@ -143,7 +143,7 @@ async fn send_at_command(uart: &mut BufferedUart<'static>, cmd: &str) {
     }
 }
 
-async fn clear_uart_buffer(uart: &mut BufferedUart<'static>) {
+async fn clear_uart_buffer(uart: &mut BufferedUart) {
     Timer::after(Duration::from_millis(500)).await;
     let mut discard = [0u8; 256];
     while embassy_time::with_timeout(Duration::from_millis(100), uart.read(&mut discard))
@@ -153,7 +153,7 @@ async fn clear_uart_buffer(uart: &mut BufferedUart<'static>) {
 }
 
 async fn fetch_via_lte(
-    uart: &mut BufferedUart<'static>,
+    uart: &mut BufferedUart,
     host: &str,
     path: &str,
 ) -> UartResponse {
@@ -316,7 +316,7 @@ async fn fetch_via_lte(
 }
 
 #[embassy_executor::task]
-async fn http_server_task(stack: &'static Stack<'_>) {
+async fn http_server_task(stack: &'static Stack<'static>) {
     info!("HTTP server starting...");
     Timer::after(Duration::from_secs(1)).await;
 
@@ -324,7 +324,7 @@ async fn http_server_task(stack: &'static Stack<'_>) {
     let mut tx_buffer = [0; 4096];
 
     loop {
-        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        let mut socket = embassy_net::tcp::TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
         socket.set_timeout(Some(Duration::from_secs(30)));
 
         info!("Listening on port 80...");
@@ -535,12 +535,13 @@ async fn main(spawner: Spawner) {
         p.PIN_24,
         p.PIN_29,
         p.DMA_CH0,
+        cyw43_pio::DEFAULT_CLOCK_DIVIDER,
     );
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
     let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
-    unwrap!(spawner.spawn(cyw43_task(runner)));
+    spawner.spawn(cyw43_task(runner)).unwrap();
 
     // Start WiFi AP
     control.init(clm).await;
@@ -559,14 +560,10 @@ async fn main(spawner: Spawner) {
     let resources = RESOURCES.init(StackResources::new());
 
     static STACK: StaticCell<Stack<'static>> = StaticCell::new();
-    let stack = &*STACK.init(Stack::new(
-        net_device,
-        config,
-        resources,
-        embassy_rp::clocks::RoscRng,
-    ));
+    let stack = &*STACK.init(Stack::new());
+    stack.init(net_device, config, resources, embassy_rp::clocks::RoscRng).await;
 
-    unwrap!(spawner.spawn(net_task(stack)));
+    spawner.spawn(net_task(stack)).unwrap();
 
     info!("Network stack initialized at 192.168.4.1");
 
@@ -585,20 +582,20 @@ async fn main(spawner: Spawner) {
 
     let uart = BufferedUart::new(
         p.UART0,
-        Irqs,
         p.PIN_12, // TX
         p.PIN_13, // RX
+        Irqs,
         uart_tx_buf,
         uart_rx_buf,
         uart_config,
     );
 
-    unwrap!(spawner.spawn(uart_task(uart)));
+    spawner.spawn(uart_task(uart)).unwrap();
 
     info!("UART initialized");
 
     // Start HTTP server
-    unwrap!(spawner.spawn(http_server_task(stack)));
+    spawner.spawn(http_server_task(stack)).unwrap();
 
     info!("==================================================");
     info!("🚀 Auto-Proxy Ready!");
