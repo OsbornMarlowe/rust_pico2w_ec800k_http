@@ -338,32 +338,72 @@ async fn http_server_task(stack: &'static embassy_net::Stack<'static>) {
         Timer::after(Duration::from_millis(100)).await;
     }
 
-    // Wait a bit more for stack to stabilize
-    Timer::after(Duration::from_secs(2)).await;
+    // Wait for stack to be configured
+    info!("Waiting for network config...");
+    loop {
+        if stack.is_config_up() {
+            info!("Network config is UP!");
+            break;
+        }
+        Timer::after(Duration::from_millis(100)).await;
+    }
 
-    info!("Network stack ready, starting HTTP server on 192.168.4.1:80");
-    info!("IMPORTANT: Clients must manually set IP:");
-    info!("  IP: 192.168.4.x (e.g., 192.168.4.2)");
-    info!("  Subnet: 255.255.255.0");
-    info!("  Gateway: 192.168.4.1");
+    Timer::after(Duration::from_secs(1)).await;
+
+    info!("==================================================");
+    info!("HTTP SERVER READY on 192.168.4.1:80");
+    info!("Client IP must be: 192.168.4.2-254/24");
+    info!("Gateway must be: 192.168.4.1");
+    info!("==================================================");
 
     let mut rx_buffer = [0; 4096];
     let mut tx_buffer = [0; 4096];
+    let mut connection_count = 0u32;
 
     loop {
         let mut socket = embassy_net::tcp::TcpSocket::new(*stack, &mut rx_buffer, &mut tx_buffer);
         socket.set_timeout(Some(Duration::from_secs(30)));
 
-        info!("Listening on TCP port 80...");
+        info!("🔵 Listening on TCP port 80... (connections: {})", connection_count);
         if let Err(e) = socket.accept(80).await {
             warn!("Accept error: {:?}", e);
             Timer::after(Duration::from_millis(100)).await;
             continue;
         }
 
-        info!("✅ Client connected from remote!");
+        connection_count += 1;
+        info!("✅ Client connected! (connection #{})", connection_count);
 
-        // Read HTTP request
+        // SIMPLE TEST: Send response immediately without reading request
+        let test_response = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+            <!DOCTYPE html><html><head><title>Pico 2W Works!</title></head>\
+            <body><h1>SUCCESS!</h1><p>Pico 2W HTTP Server is working!</p>\
+            <p>Connection #";
+
+        if let Err(e) = socket.write_all(test_response).await {
+            warn!("Write error: {:?}", e);
+            continue;
+        }
+
+        // Write connection number
+        let mut num_buf = [0u8; 32];
+        let num_str = format_connection_number(connection_count, &mut num_buf);
+        if let Err(e) = socket.write_all(num_str).await {
+            warn!("Write error: {:?}", e);
+            continue;
+        }
+
+        let end_html = b"</p></body></html>";
+        if let Err(e) = socket.write_all(end_html).await {
+            warn!("Write error: {:?}", e);
+            continue;
+        }
+
+        socket.flush().await.ok();
+        info!("✅ Response sent successfully");
+        Timer::after(Duration::from_millis(100)).await;
+
+        // Now try to read the request (non-blocking)
         let mut request_buf = [0u8; 1024];
         let mut total_read = 0;
 
@@ -385,7 +425,7 @@ async fn http_server_task(stack: &'static embassy_net::Stack<'static>) {
         }
 
         if total_read == 0 {
-            warn!("No data received");
+            info!("Client closed connection");
             continue;
         }
 
@@ -538,6 +578,27 @@ fn format_error_response(error: &str) -> String<8192> {
         error
     ));
     response
+}
+
+fn format_connection_number(num: u32, buf: &mut [u8]) -> &[u8] {
+    let mut n = num;
+    let mut i = 0;
+    if n == 0 {
+        buf[0] = b'0';
+        return &buf[0..1];
+    }
+    let mut temp = [0u8; 10];
+    let mut j = 0;
+    while n > 0 {
+        temp[j] = b'0' + (n % 10) as u8;
+        n /= 10;
+        j += 1;
+    }
+    for k in 0..j {
+        buf[i] = temp[j - 1 - k];
+        i += 1;
+    }
+    &buf[0..i]
 }
 
 #[embassy_executor::main]
