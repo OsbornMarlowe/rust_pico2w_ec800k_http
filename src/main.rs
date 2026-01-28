@@ -45,9 +45,11 @@ async fn cyw43_task(
 }
 
 #[embassy_executor::task]
-async fn net_task(stack: &'static Stack<'static>) -> ! {
-    stack.run().await
+async fn net_task(runner: &'static embassy_net::Runner<'static>) -> ! {
+    runner.run().await
 }
+
+
 
 // Global channel for UART communication
 static UART_CHANNEL: embassy_sync::channel::Channel<
@@ -316,7 +318,7 @@ async fn fetch_via_lte(
 }
 
 #[embassy_executor::task]
-async fn http_server_task(stack: &'static Stack<'static>) {
+async fn http_server_task(stack: &'static embassy_net::Stack<'static>) {
     info!("HTTP server starting...");
     Timer::after(Duration::from_secs(1)).await;
 
@@ -324,7 +326,7 @@ async fn http_server_task(stack: &'static Stack<'static>) {
     let mut tx_buffer = [0; 4096];
 
     loop {
-        let mut socket = embassy_net::tcp::TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        let mut socket = embassy_net::tcp::TcpSocket::new(*stack, &mut rx_buffer, &mut tx_buffer);
         socket.set_timeout(Some(Duration::from_secs(30)));
 
         info!("Listening on port 80...");
@@ -530,18 +532,17 @@ async fn main(spawner: Spawner) {
     let spi = PioSpi::new(
         &mut pio.common,
         pio.sm0,
+        cyw43_pio::DEFAULT_CLOCK_DIVIDER,
         pio.irq0,
         cs,
-        p.PIN_24,
         p.PIN_29,
         p.DMA_CH0,
-        cyw43_pio::DEFAULT_CLOCK_DIVIDER,
     );
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
     let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
-    spawner.spawn(cyw43_task(runner)).unwrap();
+    unwrap!(spawner.spawn(cyw43_task(runner)));
 
     // Start WiFi AP
     control.init(clm).await;
@@ -559,11 +560,10 @@ async fn main(spawner: Spawner) {
     static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
     let resources = RESOURCES.init(StackResources::new());
 
-    static STACK: StaticCell<Stack<'static>> = StaticCell::new();
-    let stack = &*STACK.init(Stack::new());
-    stack.init(net_device, config, resources, embassy_rp::clocks::RoscRng).await;
+    let (stack, runner) = embassy_net::new(net_device, config, resources, embassy_rp::clocks::RoscRng::new());
+    unwrap!(spawner.spawn(net_task(&runner)));
 
-    spawner.spawn(net_task(stack)).unwrap();
+    let stack = &stack;
 
     info!("Network stack initialized at 192.168.4.1");
 
@@ -590,12 +590,12 @@ async fn main(spawner: Spawner) {
         uart_config,
     );
 
-    spawner.spawn(uart_task(uart)).unwrap();
+    unwrap!(spawner.spawn(uart_task(uart)));
 
     info!("UART initialized");
 
     // Start HTTP server
-    spawner.spawn(http_server_task(stack)).unwrap();
+    unwrap!(spawner.spawn(http_server_task(stack)));
 
     info!("==================================================");
     info!("🚀 Auto-Proxy Ready!");
