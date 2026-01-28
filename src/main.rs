@@ -327,7 +327,25 @@ async fn fetch_via_lte(
 #[embassy_executor::task]
 async fn http_server_task(stack: &'static embassy_net::Stack<'static>) {
     info!("HTTP server starting...");
-    Timer::after(Duration::from_secs(1)).await;
+
+    // Wait for network link to be up
+    info!("Waiting for network link...");
+    loop {
+        if stack.is_link_up() {
+            info!("Network link is UP!");
+            break;
+        }
+        Timer::after(Duration::from_millis(100)).await;
+    }
+
+    // Wait a bit more for stack to stabilize
+    Timer::after(Duration::from_secs(2)).await;
+
+    info!("Network stack ready, starting HTTP server on 192.168.4.1:80");
+    info!("IMPORTANT: Clients must manually set IP:");
+    info!("  IP: 192.168.4.x (e.g., 192.168.4.2)");
+    info!("  Subnet: 255.255.255.0");
+    info!("  Gateway: 192.168.4.1");
 
     let mut rx_buffer = [0; 4096];
     let mut tx_buffer = [0; 4096];
@@ -336,13 +354,14 @@ async fn http_server_task(stack: &'static embassy_net::Stack<'static>) {
         let mut socket = embassy_net::tcp::TcpSocket::new(*stack, &mut rx_buffer, &mut tx_buffer);
         socket.set_timeout(Some(Duration::from_secs(30)));
 
-        info!("Listening on port 80...");
+        info!("Listening on TCP port 80...");
         if let Err(e) = socket.accept(80).await {
             warn!("Accept error: {:?}", e);
+            Timer::after(Duration::from_millis(100)).await;
             continue;
         }
 
-        info!("Client connected!");
+        info!("✅ Client connected from remote!");
 
         // Read HTTP request
         let mut request_buf = [0u8; 1024];
@@ -641,11 +660,21 @@ async fn main(spawner: Spawner) {
 
     info!("==================================================");
     info!("🚀 Auto-Proxy Ready!");
-    info!("Connect to WiFi: {}", WIFI_SSID);
-    info!("Password: {}", WIFI_PASSWORD);
-    info!("Open: http://192.168.4.1");
-    info!("This will automatically show: {}", DEFAULT_HOST);
-    info!("For other sites: http://192.168.4.1/proxy?url=http://example.com");
+    info!("==================================================");
+    info!("1. Connect to WiFi SSID: {}", WIFI_SSID);
+    info!("   Password: {}", WIFI_PASSWORD);
+    info!("");
+    info!("2. MANUALLY configure your device:");
+    info!("   IP Address: 192.168.4.2 (or .3, .4, etc.)");
+    info!("   Subnet Mask: 255.255.255.0");
+    info!("   Gateway: 192.168.4.1");
+    info!("   DNS: 192.168.4.1 (optional)");
+    info!("");
+    info!("3. Open browser to: http://192.168.4.1");
+    info!("   Auto-loads: {}", DEFAULT_HOST);
+    info!("   Custom: http://192.168.4.1/proxy?url=http://example.com");
+    info!("==================================================");
+    info!("NOTE: No DHCP server - manual IP required!");
     info!("==================================================");
 
     // Keep LED blinking to show alive
