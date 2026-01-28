@@ -3,8 +3,8 @@
 
 use cyw43_pio::PioSpi;
 use defmt::*;
+use core::fmt::Write as FmtWrite;
 use embassy_executor::Spawner;
-use embassy_net::tcp::TcpSocket;
 use embassy_net::{Config, Stack, StackResources};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
@@ -19,9 +19,9 @@ use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 // Program metadata
-#[link_section = ".start_block"]
+#[unsafe(link_section = ".start_block")]
 #[used]
-pub static IMAGE_DEF: embassy_rp::binary_info::ImageDef = embassy_rp::binary_info::ImageDef::secure_exe();
+pub static IMAGE_DEF: embassy_rp::block::ImageDef = embassy_rp::block::ImageDef::secure_exe();
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -44,7 +44,7 @@ async fn cyw43_task(
 }
 
 #[embassy_executor::task]
-async fn net_task(stack: &'static Stack<'static>) -> ! {
+async fn net_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
     stack.run().await
 }
 
@@ -166,7 +166,7 @@ async fn fetch_via_lte(
     // Step 1: Open TCP connection
     info!("1. Opening TCP connection...");
     let mut open_cmd = String::<256>::new();
-    let _ = write!(open_cmd, "AT+QIOPEN=1,0,\"TCP\",\"{}\",80,0,1\r\n", host);
+    let _ = FmtWrite::write_fmt(&mut open_cmd, format_args!("AT+QIOPEN=1,0,\"TCP\",\"{}\",80,0,1\r\n", host));
     let _ = uart.write_all(open_cmd.as_bytes()).await;
 
     // Wait for +QIOPEN: 0,0
@@ -205,16 +205,15 @@ async fn fetch_via_lte(
 
     // Step 2: Prepare HTTP request
     let mut http_request = String::<512>::new();
-    let _ = write!(
-        http_request,
+    let _ = FmtWrite::write_fmt(&mut http_request, format_args!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: PicoLTE-Proxy/1.0\r\n\r\n",
         path, host
-    );
+    ));
 
     // Step 3: Send HTTP data
     info!("2. Sending HTTP request...");
     let mut send_cmd = String::<64>::new();
-    let _ = write!(send_cmd, "AT+QISEND=0,{}\r\n", http_request.len());
+    let _ = FmtWrite::write_fmt(&mut send_cmd, format_args!("AT+QISEND=0,{}\r\n", http_request.len()));
     let _ = uart.write_all(send_cmd.as_bytes()).await;
 
     // Wait for '>'
@@ -316,7 +315,7 @@ async fn fetch_via_lte(
 }
 
 #[embassy_executor::task]
-async fn http_server_task(stack: &'static Stack<'_>) {
+async fn http_server_task(stack: &'static Stack<cyw43::NetDriver<'static>>) {
     info!("HTTP server starting...");
     Timer::after(Duration::from_secs(1)).await;
 
@@ -482,23 +481,17 @@ fn extract_html(data: &str) -> String<8192> {
 }
 
 fn format_http_response(content: &str) -> String<8192> {
-    use core::fmt::Write;
-
-    let mut response = String::<8192>::new();
-    let _ = write!(
-        response,
+    let mut response = String::new();
+    let _ = FmtWrite::write_fmt(&mut response, format_args!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{}",
         content
-    );
+    ));
     response
 }
 
 fn format_error_response(error: &str) -> String<8192> {
-    use core::fmt::Write;
-
-    let mut response = String::<8192>::new();
-    let _ = write!(
-        response,
+    let mut response = String::new();
+    let _ = FmtWrite::write_fmt(&mut response, format_args!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
         <!DOCTYPE html>\
         <html>\
@@ -514,7 +507,7 @@ fn format_error_response(error: &str) -> String<8192> {
         <p>Or: /proxy?url=http://example.com</p>\
         </body></html>",
         error
-    );
+    ));
     response
 }
 
@@ -536,17 +529,18 @@ async fn main(spawner: Spawner) {
     let spi = PioSpi::new(
         &mut pio.common,
         pio.sm0,
+        32_000_000,
         pio.irq0,
         cs,
-        p.PIN_24,
         p.PIN_29,
+        p.PIN_24,
         p.DMA_CH0,
     );
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
     let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
-    unwrap!(spawner.spawn(cyw43_task(runner)));
+    spawner.spawn(cyw43_task(runner)).unwrap();
 
     // Start WiFi AP
     control.init(clm).await;
@@ -564,7 +558,7 @@ async fn main(spawner: Spawner) {
     static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
     let resources = RESOURCES.init(StackResources::new());
 
-    static STACK: StaticCell<Stack<'static>> = StaticCell::new();
+    static STACK: StaticCell<Stack<cyw43::NetDriver<'static>>> = StaticCell::new();
     let stack = &*STACK.init(Stack::new(
         net_device,
         config,
@@ -572,7 +566,7 @@ async fn main(spawner: Spawner) {
         embassy_rp::clocks::RoscRng,
     ));
 
-    unwrap!(spawner.spawn(net_task(stack)));
+    spawner.spawn(net_task(stack)).unwrap();
 
     info!("Network stack initialized at 192.168.4.1");
 
@@ -591,20 +585,20 @@ async fn main(spawner: Spawner) {
 
     let uart = BufferedUart::new(
         p.UART0,
-        Irqs,
         p.PIN_13, // RX
         p.PIN_12, // TX
+        Irqs,
         uart_tx_buf,
         uart_rx_buf,
         uart_config,
     );
 
-    unwrap!(spawner.spawn(uart_task(uart)));
+    spawner.spawn(uart_task(uart)).unwrap();
 
     info!("UART initialized");
 
     // Start HTTP server
-    unwrap!(spawner.spawn(http_server_task(stack)));
+    spawner.spawn(http_server_task(stack)).unwrap();
 
     info!("==================================================");
     info!("🚀 Auto-Proxy Ready!");

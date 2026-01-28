@@ -80,6 +80,10 @@ elf2uf2-rs target/thumbv8m.main-none-eabihf/release/pico2w-wifi-gateway pico2w-w
 
 📖 **[Implementation Summary](IMPLEMENTATION_SUMMARY.md)** - Technical details and architecture
 
+📖 **[Embassy API Fixes](EMBASSY_API_FIXES.md)** - Comprehensive guide to all API compatibility fixes
+
+📖 **[Quick Fix Reference](QUICK_FIX_REFERENCE.md)** - One-liner solutions for common Embassy API issues
+
 ## Configuration
 
 All settings can be modified in `src/main.rs`:
@@ -131,6 +135,11 @@ Browser ← WiFi ← HTTP Server ← UART Task ← EC800K ← Internet
 
 ## Troubleshooting
 
+### Compilation Errors
+- See [EMBASSY_API_FIXES.md](EMBASSY_API_FIXES.md) for all API compatibility fixes
+- See [QUICK_FIX_REFERENCE.md](QUICK_FIX_REFERENCE.md) for quick solutions
+- Ensure you're using the correct Embassy revision: `286d887529c66d8d1b4c7b56849e7a95386d79db`
+
 ### WiFi not appearing
 - Verify you have Pico **2W** (not regular Pico 2)
 - Wait 10-20 seconds after power-up
@@ -159,10 +168,12 @@ See [QUICK_START.md](QUICK_START.md) for detailed troubleshooting.
 
 ## Dependencies
 
-- [embassy-rs](https://github.com/embassy-rs/embassy) - Async embedded framework
+- [embassy-rs](https://github.com/embassy-rs/embassy) - Async embedded framework (rev: 286d887)
 - [cyw43](https://github.com/embassy-rs/embassy/tree/main/cyw43) - WiFi driver
 - [defmt](https://github.com/knurling-rs/defmt) - Efficient logging
 - [heapless](https://github.com/rust-embedded/heapless) - Stack-allocated collections
+
+**Note:** This project targets a specific Embassy commit. See [EMBASSY_API_FIXES.md](EMBASSY_API_FIXES.md) for version details.
 
 ## License
 
