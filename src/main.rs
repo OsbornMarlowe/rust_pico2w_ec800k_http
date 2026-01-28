@@ -361,12 +361,13 @@ async fn http_server_task(stack: &'static embassy_net::Stack<'static>) {
     let mut connection_count = 0u32;
 
     loop {
+        info!("🔵 Creating new socket...");
         let mut socket = embassy_net::tcp::TcpSocket::new(*stack, &mut rx_buffer, &mut tx_buffer);
-        socket.set_timeout(Some(Duration::from_secs(30)));
+        socket.set_timeout(Some(Duration::from_secs(10)));
 
         info!("🔵 Listening on TCP port 80... (connections: {})", connection_count);
         if let Err(e) = socket.accept(80).await {
-            warn!("Accept error: {:?}", e);
+            warn!("❌ Accept error: {:?}", e);
             Timer::after(Duration::from_millis(100)).await;
             continue;
         }
@@ -374,34 +375,32 @@ async fn http_server_task(stack: &'static embassy_net::Stack<'static>) {
         connection_count += 1;
         info!("✅ Client connected! (connection #{})", connection_count);
 
-        // SIMPLE TEST: Send response immediately without reading request
-        let test_response = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
-            <!DOCTYPE html><html><head><title>Pico 2W Works!</title></head>\
-            <body><h1>SUCCESS!</h1><p>Pico 2W HTTP Server is working!</p>\
-            <p>Connection #";
+        // Send MINIMAL response immediately
+        info!("Sending HTTP response...");
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 27\r\nConnection: close\r\n\r\n<h1>Pico 2W Works!</h1>\r\n";
 
-        if let Err(e) = socket.write_all(test_response).await {
-            warn!("Write error: {:?}", e);
-            continue;
+        match socket.write_all(response).await {
+            Ok(_) => {
+                info!("✅ Response written");
+            }
+            Err(e) => {
+                warn!("❌ Write error: {:?}", e);
+                Timer::after(Duration::from_millis(100)).await;
+                continue;
+            }
         }
 
-        // Write connection number
-        let mut num_buf = [0u8; 32];
-        let num_str = format_connection_number(connection_count, &mut num_buf);
-        if let Err(e) = socket.write_all(num_str).await {
-            warn!("Write error: {:?}", e);
-            continue;
+        match socket.flush().await {
+            Ok(_) => {
+                info!("✅ Response flushed");
+            }
+            Err(e) => {
+                warn!("❌ Flush error: {:?}", e);
+            }
         }
 
-        let end_html = b"</p></body></html>";
-        if let Err(e) = socket.write_all(end_html).await {
-            warn!("Write error: {:?}", e);
-            continue;
-        }
-
-        socket.flush().await.ok();
-        info!("✅ Response sent successfully");
-        Timer::after(Duration::from_millis(100)).await;
+        info!("✅ Response sent successfully to client");
+        Timer::after(Duration::from_millis(500)).await;
 
         // Now try to read the request (non-blocking)
         let mut request_buf = [0u8; 1024];
@@ -717,7 +716,9 @@ async fn main(spawner: Spawner) {
     info!("UART initialized");
 
     // Start HTTP server
+    info!("Spawning HTTP server task...");
     spawner.spawn(unwrap!(http_server_task(stack)));
+    info!("✅ HTTP server task spawned successfully");
 
     info!("==================================================");
     info!("🚀 Auto-Proxy Ready!");
