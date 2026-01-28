@@ -156,6 +156,8 @@ async fn fetch_via_lte(
     host: &str,
     path: &str,
 ) -> UartResponse {
+    use core::fmt::Write;
+
     info!("Fetching http://{}{} via LTE...", host, path);
 
     // Clear buffer
@@ -164,7 +166,6 @@ async fn fetch_via_lte(
     // Step 1: Open TCP connection
     info!("1. Opening TCP connection...");
     let mut open_cmd = String::<256>::new();
-    use core::fmt::Write;
     let _ = write!(open_cmd, "AT+QIOPEN=1,0,\"TCP\",\"{}\",80,0,1\r\n", host);
     let _ = uart.write_all(open_cmd.as_bytes()).await;
 
@@ -315,7 +316,7 @@ async fn fetch_via_lte(
 }
 
 #[embassy_executor::task]
-async fn http_server_task(stack: &'static Stack<'static>) {
+async fn http_server_task(stack: &'static Stack<'_>) {
     info!("HTTP server starting...");
     Timer::after(Duration::from_secs(1)).await;
 
@@ -481,8 +482,9 @@ fn extract_html(data: &str) -> String<8192> {
 }
 
 fn format_http_response(content: &str) -> String<8192> {
-    let mut response = String::<8192>::new();
     use core::fmt::Write;
+
+    let mut response = String::<8192>::new();
     let _ = write!(
         response,
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{}",
@@ -492,8 +494,9 @@ fn format_http_response(content: &str) -> String<8192> {
 }
 
 fn format_error_response(error: &str) -> String<8192> {
-    let mut response = String::<8192>::new();
     use core::fmt::Write;
+
+    let mut response = String::<8192>::new();
     let _ = write!(
         response,
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
@@ -547,9 +550,7 @@ async fn main(spawner: Spawner) {
 
     // Start WiFi AP
     control.init(clm).await;
-    control
-        .start_ap_open(WIFI_SSID, 5)
-        .await;
+    control.start_ap_open(WIFI_SSID, 5).await;
 
     info!("WiFi AP started!");
 
