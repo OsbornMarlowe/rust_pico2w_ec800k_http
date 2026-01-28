@@ -543,7 +543,7 @@ async fn main(spawner: Spawner) {
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
     let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
-    unwrap!(spawner.spawn(unwrap!(cyw43_task(runner))));
+    spawner.spawn(unwrap!(cyw43_task(runner)));
 
     // Start WiFi AP
     control.init(clm).await;
@@ -562,7 +562,7 @@ async fn main(spawner: Spawner) {
     let resources = RESOURCES.init(StackResources::new());
 
     let (stack, mut runner) = embassy_net::new(net_device, config, resources, embassy_rp::clocks::RoscRng.next_u64());
-    unwrap!(spawner.spawn(unwrap!(net_task(&mut runner))));
+    spawner.spawn(unwrap!(net_task(&mut runner)));
 
     let stack = &stack;
 
@@ -591,12 +591,12 @@ async fn main(spawner: Spawner) {
         uart_config,
     );
 
-    unwrap!(spawner.spawn(unwrap!(uart_task(uart))));
+    spawner.spawn(unwrap!(uart_task(uart)));
 
     info!("UART initialized");
 
     // Start HTTP server
-    unwrap!(spawner.spawn(unwrap!(http_server_task(stack))));
+    spawner.spawn(unwrap!(http_server_task(stack)));
 
     info!("==================================================");
     info!("🚀 Auto-Proxy Ready!");
