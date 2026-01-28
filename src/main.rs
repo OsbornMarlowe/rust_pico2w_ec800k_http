@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use cyw43_pio::PioSpi;
+use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use core::fmt::Write as FmtWrite;
 use embassy_executor::Spawner;
@@ -19,10 +19,17 @@ use heapless::String;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
-// Program metadata
-#[unsafe(link_section = ".start_block")]
+// Program metadata for `picotool info`
+#[unsafe(link_section = ".bi_entries")]
 #[used]
-pub static IMAGE_DEF: embassy_rp::block::ImageDef = embassy_rp::block::ImageDef::secure_exe();
+pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 4] = [
+    embassy_rp::binary_info::rp_program_name!(c"Pico2W LTE Proxy"),
+    embassy_rp::binary_info::rp_program_description!(
+        c"WiFi AP + LTE HTTP Proxy via EC800K module"
+    ),
+    embassy_rp::binary_info::rp_cargo_version!(),
+    embassy_rp::binary_info::rp_program_build_attribute!(),
+];
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -518,21 +525,30 @@ fn format_error_response(error: &str) -> String<8192> {
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
+    info!("=== BOOT: Pico 2W Starting ===");
+    Timer::after(Duration::from_millis(500)).await;
+
     info!("=== Pico 2W LTE Proxy ===");
     info!("WiFi AP: {} / {}", WIFI_SSID, WIFI_PASSWORD);
     info!("UART: {} baud on GP12/GP13", UART_BAUDRATE);
 
     // Initialize WiFi
+    info!("Loading WiFi firmware...");
     let fw = include_bytes!("../cyw43-firmware/43439A0.bin");
     let clm = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
+    info!("Firmware loaded: {} bytes, CLM: {} bytes", fw.len(), clm.len());
 
+    info!("Initializing CYW43 pins...");
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
     let mut pio = Pio::new(p.PIO0, Irqs);
+    info!("PIO initialized");
     let spi = PioSpi::new(
         &mut pio.common,
         pio.sm0,
-        cyw43_pio::DEFAULT_CLOCK_DIVIDER,
+        // Use RM2_CLOCK_DIVIDER for reliable SPI communication on Pico 2W
+        // DEFAULT_CLOCK_DIVIDER is too fast and causes issues
+        RM2_CLOCK_DIVIDER,
         pio.irq0,
         cs,
         p.PIN_24,
@@ -540,23 +556,41 @@ async fn main(spawner: Spawner) {
         p.DMA_CH0,
     );
 
+    info!("Creating CYW43 state...");
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
+
+    info!("Initializing CYW43 driver...");
+    Timer::after(Duration::from_secs(1)).await;
     let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
+    info!("CYW43 driver initialized");
+
     spawner.spawn(unwrap!(cyw43_task(runner)));
+    info!("CYW43 task spawned");
 
     // Start WiFi AP
+    info!("Initializing WiFi with CLM data...");
     control.init(clm).await;
+    info!("CLM initialized");
+
+    // Set power management mode
+    control.set_power_management(cyw43::PowerManagementMode::PowerSave).await;
+
+    Timer::after(Duration::from_millis(500)).await;
+    info!("Starting AP mode: SSID={}", WIFI_SSID);
     control.start_ap_open(WIFI_SSID, 5).await;
 
-    info!("WiFi AP started!");
+    info!("WiFi AP started successfully!");
+    Timer::after(Duration::from_millis(500)).await;
 
     // Configure network stack with static IP
+    info!("Configuring network stack...");
     let config = Config::ipv4_static(embassy_net::StaticConfigV4 {
         address: embassy_net::Ipv4Cidr::new(embassy_net::Ipv4Address::new(192, 168, 4, 1), 24),
         dns_servers: heapless::Vec::new(),
         gateway: None,
     });
+    info!("Network config: 192.168.4.1/24");
 
     static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
     let resources = RESOURCES.init(StackResources::new());
@@ -608,16 +642,23 @@ async fn main(spawner: Spawner) {
     info!("==================================================");
     info!("🚀 Auto-Proxy Ready!");
     info!("Connect to WiFi: {}", WIFI_SSID);
+    info!("Password: {}", WIFI_PASSWORD);
     info!("Open: http://192.168.4.1");
     info!("This will automatically show: {}", DEFAULT_HOST);
     info!("For other sites: http://192.168.4.1/proxy?url=http://example.com");
     info!("==================================================");
 
     // Keep LED blinking to show alive
+    info!("Starting LED blink loop...");
+    let mut blink_count = 0u32;
     loop {
         control.gpio_set(0, true).await;
-        Timer::after(Duration::from_secs(1)).await;
+        Timer::after(Duration::from_millis(500)).await;
         control.gpio_set(0, false).await;
-        Timer::after(Duration::from_secs(1)).await;
+        Timer::after(Duration::from_millis(500)).await;
+        blink_count += 1;
+        if blink_count % 10 == 0 {
+            info!("LED blink count: {}", blink_count);
+        }
     }
 }
